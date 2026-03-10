@@ -1,0 +1,55 @@
+{
+  "users": {},
+  "meals": [
+    {
+      "name": "Calzone Salami Napoletano e Cipolla",
+      "kcal": 535,
+      "protein": 30,
+      "carbs": 57,
+      "fat": 24,
+      "portion_g": 270,
+      "source": "label",
+      "user_id": "1363297088",
+      "date": "2026-03-10",
+      "time": "17:50",
+      "id": "1363297088_1773161454.899301"
+    },
+    {
+      "name": "Kurczak w kremowym sosie cebulowym",
+      "kcal": 372,
+      "protein": 36,
+      "carbs": 20,
+      "fat": 15,
+      "portion_g": 380,
+      "source": "label",
+      "user_id": "1363297088",
+      "date": "2026-03-10",
+      "time": "17:51",
+      "id": "1363297088_1773161490.572573"
+    },
+    {
+      "name": "Kawa z cukrem",
+      "kcal": 19,
+      "protein": 0.0,
+      "carbs": 5.0,
+      "fat": 0.0,
+      "source": "photo",
+      "user_id": "1363297088",
+      "date": "2026-03-10",
+      "time": "17:54",
+      "id": "1363297088_1773161669.669998"
+    },
+    {
+      "name": "Dwie kostki czekolady",
+      "kcal": 172,
+      "protein": 1.6,
+      "carbs": 18.0,
+      "fat": 10.4,
+      "source": "photo",
+      "user_id": "1363297088",
+      "date": "2026-03-10",
+      "time": "17:55",
+      "id": "1363297088_1773161705.530827"
+    }
+  ]
+}
