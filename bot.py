@@ -26,67 +26,78 @@ logger = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 import os
+import urllib.request
 
-DATA_FILE = "data.json"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"users": {}, "meals": []}
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-db = load_data()
+def sb_request(method, table, data=None, params=""):
+    url = f"{SUPABASE_URL}/rest/v1/{table}{params}"
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("apikey", SUPABASE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Prefer", "return=representation")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        logger.error(f"Supabase {method} {table}: {e.read()}")
+        return []
 
 def get_goal(user_id):
-    return db["users"].get(str(user_id), {}).get("goal", DEFAULT_KCAL_GOAL)
+    rows = sb_request("GET", "users", params=f"?user_id=eq.{user_id}&select=goal")
+    return rows[0]["goal"] if rows else DEFAULT_KCAL_GOAL
 
 def set_goal(user_id, goal):
-    uid = str(user_id)
-    if uid not in db["users"]:
-        db["users"][uid] = {}
-    db["users"][uid]["goal"] = goal
-    save_data(db)
+    existing = sb_request("GET", "users", params=f"?user_id=eq.{user_id}")
+    if existing:
+        sb_request("PATCH", "users", {"goal": goal}, f"?user_id=eq.{user_id}")
+    else:
+        sb_request("POST", "users", {"user_id": str(user_id), "goal": goal})
 
 def today_str():
     return date.today().isoformat()
 
 def get_today_meals(user_id):
-    return [m for m in db["meals"] if m["user_id"] == str(user_id) and m["date"] == today_str()]
+    return sb_request("GET", "meals", params=f"?user_id=eq.{user_id}&date=eq.{today_str()}&order=created_at.asc")
 
 def get_today_kcal(user_id):
-    return sum(m["kcal"] for m in get_today_meals(user_id))
+    meals = get_today_meals(user_id)
+    return sum(m.get("kcal", 0) for m in meals)
 
 def add_meal(user_id, meal):
-    meal["user_id"] = str(user_id)
-    meal["date"] = today_str()
-    meal["time"] = datetime.now().strftime("%H:%M")
-    meal["id"] = f"{user_id}_{datetime.now().timestamp()}"
-    db["meals"].append(meal)
-    save_data(db)
-    return meal
+    row = {
+        "id": f"{user_id}_{datetime.now().timestamp()}",
+        "user_id": str(user_id),
+        "date": today_str(),
+        "time": datetime.now().strftime("%H:%M"),
+        "name": meal.get("name", "Posiłek"),
+        "kcal": int(meal.get("kcal", 0)),
+        "protein": float(meal.get("protein_g", meal.get("protein", 0))),
+        "carbs": float(meal.get("carbs_g", meal.get("carbs", 0))),
+        "fat": float(meal.get("fat_g", meal.get("fat", 0))),
+        "source": meal.get("source", "photo"),
+        "emoji": meal.get("emoji", "🍴"),
+    }
+    sb_request("POST", "meals", row)
+    return row
 
 def get_last_meal(user_id):
-    meals = [m for m in db["meals"] if m["user_id"] == str(user_id)]
-    return meals[-1] if meals else None
+    rows = sb_request("GET", "meals", params=f"?user_id=eq.{user_id}&order=created_at.desc&limit=1")
+    return rows[0] if rows else None
 
 def delete_meal_by_id(meal_id):
-    db["meals"] = [m for m in db["meals"] if m.get("id") != meal_id]
-    save_data(db)
+    sb_request("DELETE", "meals", params=f"?id=eq.{meal_id}")
 
 def get_week_meals(user_id):
     from datetime import timedelta
     result = []
     for i in range(6, -1, -1):
         d = (date.today() - timedelta(days=i)).isoformat()
-        day_meals = [m for m in db["meals"] if m["user_id"] == str(user_id) and m["date"] == d]
-        kcal = sum(m["kcal"] for m in day_meals)
+        rows = sb_request("GET", "meals", params=f"?user_id=eq.{user_id}&date=eq.{d}")
+        kcal = sum(m.get("kcal", 0) for m in rows)
         dt = datetime.strptime(d, "%Y-%m-%d")
         result.append({"date": dt.strftime("%d.%m"), "day": ["Pn","Wt","Sr","Cz","Pt","Sb","Nd"][dt.weekday()], "kcal": kcal})
     return result
@@ -448,16 +459,16 @@ def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
 
 @api.get("/api/today")
 def api_today(user: str = Depends(check_auth)):
-    data = load_data()
     today = date.today().isoformat()
-    # znajdz pierwszego usera
-    user_ids = list(data["users"].keys())
-    if not user_ids:
-        return {"meals": [], "total_kcal": 0, "goal": DEFAULT_KCAL_GOAL, "date": today}
-    uid = user_ids[0]
-    meals = [m for m in data["meals"] if m["user_id"] == uid and m["date"] == today]
-    total = sum(m["kcal"] for m in meals)
-    goal = data["users"][uid].get("goal", DEFAULT_KCAL_GOAL)
+    # pobierz pierwszego usera z Supabase
+    users = sb_request("GET", "users", params="?order=user_id.asc&limit=1")
+    uid = users[0]["user_id"] if users else None
+    goal = users[0]["goal"] if users else DEFAULT_KCAL_GOAL
+    if uid:
+        meals = sb_request("GET", "meals", params=f"?user_id=eq.{uid}&date=eq.{today}&order=created_at.asc")
+    else:
+        meals = []
+    total = sum(m.get("kcal", 0) for m in meals)
     return {
         "date": today,
         "goal": goal,
@@ -472,17 +483,16 @@ def api_today(user: str = Depends(check_auth)):
 @api.get("/api/history")
 def api_history(user: str = Depends(check_auth)):
     from datetime import timedelta
-    data = load_data()
-    user_ids = list(data["users"].keys())
-    uid = user_ids[0] if user_ids else None
+    users = sb_request("GET", "users", params="?order=user_id.asc&limit=1")
+    uid = users[0]["user_id"] if users else None
     result = []
     for i in range(6, -1, -1):
         d = (date.today() - timedelta(days=i)).isoformat()
         if uid:
-            day_meals = [m for m in data["meals"] if m["user_id"] == uid and m["date"] == d]
+            day_meals = sb_request("GET", "meals", params=f"?user_id=eq.{uid}&date=eq.{d}")
         else:
             day_meals = []
-        kcal = sum(m["kcal"] for m in day_meals)
+        kcal = sum(m.get("kcal", 0) for m in day_meals)
         dt = datetime.strptime(d, "%Y-%m-%d")
         result.append({
             "date": d,
