@@ -419,5 +419,94 @@ def main():
     logger.info("NutriBot uruchomiony!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
+
+# ── API ─────────────────────────────────────────────────────
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, FileResponse
+import secrets
+import uvicorn
+import threading
+
+DASHBOARD_USER = os.getenv("DASHBOARD_USER", "marek")
+DASHBOARD_PASS = os.getenv("DASHBOARD_PASS", "nutribot123")
+
+api = FastAPI()
+security = HTTPBasic()
+
+def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    ok_user = secrets.compare_digest(credentials.username.encode(), DASHBOARD_USER.encode())
+    ok_pass = secrets.compare_digest(credentials.password.encode(), DASHBOARD_PASS.encode())
+    if not (ok_user and ok_pass):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Nieprawidlowe haslo",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+@api.get("/api/today")
+def api_today(user: str = Depends(check_auth)):
+    data = load_data()
+    today = date.today().isoformat()
+    # znajdz pierwszego usera
+    user_ids = list(data["users"].keys())
+    if not user_ids:
+        return {"meals": [], "total_kcal": 0, "goal": DEFAULT_KCAL_GOAL, "date": today}
+    uid = user_ids[0]
+    meals = [m for m in data["meals"] if m["user_id"] == uid and m["date"] == today]
+    total = sum(m["kcal"] for m in meals)
+    goal = data["users"][uid].get("goal", DEFAULT_KCAL_GOAL)
+    return {
+        "date": today,
+        "goal": goal,
+        "total_kcal": total,
+        "remaining": goal - total,
+        "total_protein": round(sum(m.get("protein", 0) for m in meals), 1),
+        "total_carbs":   round(sum(m.get("carbs", 0)   for m in meals), 1),
+        "total_fat":     round(sum(m.get("fat", 0)     for m in meals), 1),
+        "meals": meals
+    }
+
+@api.get("/api/history")
+def api_history(user: str = Depends(check_auth)):
+    from datetime import timedelta
+    data = load_data()
+    user_ids = list(data["users"].keys())
+    uid = user_ids[0] if user_ids else None
+    result = []
+    for i in range(6, -1, -1):
+        d = (date.today() - timedelta(days=i)).isoformat()
+        if uid:
+            day_meals = [m for m in data["meals"] if m["user_id"] == uid and m["date"] == d]
+        else:
+            day_meals = []
+        kcal = sum(m["kcal"] for m in day_meals)
+        dt = datetime.strptime(d, "%Y-%m-%d")
+        result.append({
+            "date": d,
+            "label": dt.strftime("%d.%m"),
+            "day": ["Pn","Wt","Sr","Cz","Pt","Sb","Nd"][dt.weekday()],
+            "kcal": kcal,
+            "meals_count": len(day_meals)
+        })
+    return result
+
+@api.get("/", response_class=HTMLResponse)
+def dashboard(user: str = Depends(check_auth)):
+    if os.path.exists("dashboard.html"):
+        with open("dashboard.html") as f:
+            return f.read()
+    return "<h1>Dashboard nie znaleziony</h1>"
+
+def run_api():
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(api, host="0.0.0.0", port=port, log_level="warning")
+
 if __name__ == "__main__":
+    # Uruchom API w tle, bot w głównym wątku
+    t = threading.Thread(target=run_api, daemon=True)
+    t.start()
+    logger.info(f"API uruchomione na porcie {os.getenv('PORT', 8000)}")
     main()
