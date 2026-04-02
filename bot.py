@@ -27,6 +27,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 import os
 import urllib.request
+import time
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -427,6 +428,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    time.sleep(5)
     logger.info("NutriBot uruchomiony!")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
