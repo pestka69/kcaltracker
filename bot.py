@@ -1,13 +1,22 @@
 """
 NutriBot — bot Telegram do śledzenia diety
-Używa HTML parse_mode zamiast MarkdownV2 (brak problemów z escapowaniem)
+Webhook mode + FastAPI dashboard
 """
 import logging
 import asyncio
 import base64
 import json
 import re
+import os
+import urllib.request
 from datetime import datetime, date, timezone
+
+# ── FastAPI (musi być przed botem) ──────────────────────────
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.responses import HTMLResponse
+import secrets
+import uvicorn
 
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,12 +34,10 @@ logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-import os
-import urllib.request
-
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
+# ── Supabase ─────────────────────────────────────────────────
 def sb_request(method, table, data=None, params=""):
     url = f"{SUPABASE_URL}/rest/v1/{table}{params}"
     body = json.dumps(data).encode() if data else None
@@ -57,6 +64,11 @@ def set_goal(user_id, goal):
     else:
         sb_request("POST", "users", {"user_id": str(user_id), "goal": goal})
 
+def ensure_user(user_id):
+    existing = sb_request("GET", "users", params=f"?user_id=eq.{user_id}")
+    if not existing:
+        sb_request("POST", "users", {"user_id": str(user_id), "goal": DEFAULT_KCAL_GOAL})
+
 def today_str():
     return date.today().isoformat()
 
@@ -64,10 +76,10 @@ def get_today_meals(user_id):
     return sb_request("GET", "meals", params=f"?user_id=eq.{user_id}&date=eq.{today_str()}&order=created_at.asc")
 
 def get_today_kcal(user_id):
-    meals = get_today_meals(user_id)
-    return sum(m.get("kcal", 0) for m in meals)
+    return sum(m.get("kcal", 0) for m in get_today_meals(user_id))
 
 def add_meal(user_id, meal):
+    ensure_user(user_id)
     row = {
         "id": f"{user_id}_{datetime.now().timestamp()}",
         "user_id": str(user_id),
@@ -92,6 +104,7 @@ def delete_meal_by_id(meal_id):
     sb_request("DELETE", "meals", params=f"?id=eq.{meal_id}")
 
 def get_week_meals(user_id):
+    from datetime import timedelta
     result = []
     for i in range(6, -1, -1):
         d = (date.today() - timedelta(days=i)).isoformat()
@@ -101,6 +114,7 @@ def get_week_meals(user_id):
         result.append({"date": dt.strftime("%d.%m"), "day": ["Pn","Wt","Sr","Cz","Pt","Sb","Nd"][dt.weekday()], "kcal": kcal})
     return result
 
+# ── Claude vision ─────────────────────────────────────────────
 def analyze_photo_sync(image_bytes):
     b64 = base64.standard_b64encode(image_bytes).decode()
     resp = client.messages.create(
@@ -109,44 +123,57 @@ def analyze_photo_sync(image_bytes):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": """Przeanalizuj to zdjecie jedzenia.
-
-Okresl typ: "label" (etykieta z tabelka wartosci odzywczych), "fridge" (lodowka), "meal" (posilek).
-
-Odpowiedz TYLKO w JSON bez markdown:
-
-Dla meal:
-{"type":"meal","name":"nazwa po polsku","kcal":450,"protein_g":35,"carbs_g":55,"fat_g":18,"portion_g":350,"items":[{"name":"skladnik","amount_g":150,"kcal":200}],"needs_clarification":false,"clarification_question":null,"confidence":"high"}
-
-Dla label:
-{"type":"label","name":"nazwa produktu","kcal_100g":250,"protein_100g":15,"carbs_100g":30,"fat_100g":8,"portion_g":270,"kcal_total":675,"protein_total":40,"carbs_total":81,"fat_total":22}
-
-Dla fridge:
-{"type":"fridge","items":[{"name":"produkt","amount_g":300,"kcal_per_100g":150,"kcal_total":450}]}
-
-Jesli to etykieta odczytaj DOKLADNIE liczby z tabeli wartosci odzywczych. Odpowiedz TYLKO JSON."""}
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Przeanalizuj to zdjecie. Najpierw okresl typ:\n"
+                        "1. 'meal' - gotowy posilek lub jedzenie\n"
+                        "2. 'label' - etykieta/opakowanie z tabela wartosci odzywczych\n"
+                        "3. 'fridge' - zawartosc lodowki/spizarni\n\n"
+                        "Odpowiedz TYLKO w JSON:\n"
+                        "Dla meal: {\"type\":\"meal\",\"name\":\"nazwa po polsku\",\"kcal\":500,\"protein_g\":30,\"carbs_g\":50,\"fat_g\":15,\"confidence\":\"high\",\"emoji\":\"🍗\"}\n"
+                        "Dla label: {\"type\":\"label\",\"name\":\"nazwa produktu\",\"kcal_100g\":250,\"protein_100g\":10,\"carbs_100g\":30,\"fat_100g\":8,\"needs_portion\":true}\n"
+                        "Dla fridge: {\"type\":\"fridge\",\"items\":[\"jajka\",\"mleko\"],\"suggestion\":\"omlet z warzywami\",\"suggestion_kcal\":400}\n"
+                        "Dla niewyraznego zdjecia: {\"type\":\"error\",\"error\":\"opis problemu\"}"
+                    )
+                }
             ]
         }]
     )
-    text = resp.content[0].text.strip()
-    text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
-    try:
-        data = json.loads(text)
-        return data.get("type", "meal"), data
-    except Exception as e:
-        logger.error(f"JSON parse error: {e} | raw: {text[:200]}")
-        return "error", {"error": str(e)}
+    raw = re.sub(r"```(?:json)?\s*", "", resp.content[0].text.strip()).rstrip("`").strip()
+    data = json.loads(raw)
+    photo_type = data.get("type", "meal")
+    return photo_type, data
 
+def parse_text_meal_sync(text):
+    resp = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=400,
+        messages=[{"role": "user", "content":
+            f"Uzytkownik opisal co zjadl/wypil: \"{text}\"\n\n"
+            "Oblicz wartosci odzywcze na podstawie podanych ilosci.\n"
+            "Uzyj standardowych wartosci dla tych produktow.\n"
+            "Odpowiedz TYLKO JSON bez markdown:\n"
+            '{"name":"krotka nazwa po polsku","kcal":150,"protein_g":5,"carbs_g":20,"fat_g":3,"items":[{"name":"skladnik","amount_g":20,"kcal":80}],"confidence":"high"}'
+        }]
+    )
+    raw = re.sub(r"```(?:json)?\s*", "", resp.content[0].text.strip()).rstrip("`").strip()
+    return json.loads(raw)
+
+# ── Telegram handlers ─────────────────────────────────────────
 async def cmd_start(update, ctx):
-    name = update.effective_user.first_name
     await update.message.reply_text(
-        f"Czesc <b>{name}</b>! Jestem <b>NutriBot</b>\n\n"
-        "Wyslij zdjecie posilku, etykiety lub lodowki.\n\n"
-        "/dzisiaj — podsumowanie dnia\n"
-        "/cel — ustaw cel kaloryczny\n"
-        "/historia — ostatnie 7 dni\n"
-        "/usun — usun ostatni wpis",
+        "Czesc! Jestem NutriBot.\n\n"
+        "Wyslij mi:\n"
+        "📷 <b>Zdjecie posilku</b> — oszacuje kalorie\n"
+        "🏷 <b>Zdjecie etykiety</b> — odczytam wartosci\n"
+        "❄️ <b>Zdjecie lodowki</b> — zaproponuje posilek\n"
+        "✍️ <b>Opis tekstowy</b> — np. 'zjadlem owsianke 60g z bananem'\n\n"
+        "/dzisiaj /cel /historia",
         parse_mode="HTML"
     )
 
@@ -154,59 +181,73 @@ async def cmd_dzisiaj(update, ctx):
     user_id = update.effective_user.id
     meals = get_today_meals(user_id)
     goal = get_goal(user_id)
-    total = get_today_kcal(user_id)
+    total = sum(m.get("kcal", 0) for m in meals)
     remaining = goal - total
-    pct = int(total / goal * 100) if goal else 0
-    bar = "X" * min(pct // 10, 10) + "." * max(0, 10 - pct // 10)
-    lines = [
-        f"Dzis {date.today().strftime('%d.%m.%Y')}\n",
-        f"Kalorie: <b>{total} / {goal} kcal</b>",
-        f"[{bar}] {pct}%",
-        f"Pozostalo: <b>{abs(remaining)} kcal</b>\n",
-    ]
-    if meals:
-        lines.append("<b>Posilki:</b>")
-        for m in meals:
-            lines.append(f"  {m['name']} — <b>{m['kcal']} kcal</b> ({m.get('time','')})")
+    pct = min(int(total / goal * 100), 100) if goal else 0
+    bar_filled = pct // 10
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    lines = [f"<b>Dzisiaj — {today_str()}</b>\n"]
+    for m in meals:
+        lines.append(f"• {m.get('name','?')} — <b>{m.get('kcal',0)} kcal</b>")
+    lines.append(f"\n{bar} {pct}%")
+    lines.append(f"Razem: <b>{total} / {goal} kcal</b>")
+    if remaining >= 0:
+        lines.append(f"Pozostalo: <b>{remaining} kcal</b>")
     else:
-        lines.append("<i>Brak wpisow. Wyslij zdjecie!</i>")
+        lines.append(f"Przekroczono o: <b>{abs(remaining)} kcal</b>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def cmd_historia(update, ctx):
     user_id = update.effective_user.id
-    history = get_week_meals(user_id)
-    goal = get_goal(user_id)
+    week = get_week_meals(user_id)
     lines = ["<b>Ostatnie 7 dni:</b>\n"]
-    for d in history:
-        if d["kcal"] == 0:
-            lines.append(f"  {d['day']} {d['date']} — brak danych")
-            continue
-        pct = int(d["kcal"] / goal * 100) if goal else 0
-        status = "OK" if 90 <= pct <= 110 else ("OVER" if pct > 110 else "LOW")
-        lines.append(f"[{status}] <b>{d['day']} {d['date']}</b> — {d['kcal']} kcal ({pct}%)")
+    for d in week:
+        bar = "█" * min(d["kcal"] // 200, 10)
+        lines.append(f"{d['day']} {d['date']}  {bar} <b>{d['kcal']}</b> kcal")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def cmd_cel(update, ctx):
+    await update.message.reply_text("Podaj swoj dzienny cel kaloryczny (np. 2000):")
     ctx.user_data["awaiting_goal"] = True
-    await update.message.reply_text(
-        f"Aktualny cel: <b>{get_goal(update.effective_user.id)} kcal</b>\n\nPodaj nowy cel (np. 2000):",
-        parse_mode="HTML"
-    )
 
 async def cmd_usun(update, ctx):
     user_id = update.effective_user.id
-    last = get_last_meal(user_id)
-    if not last:
-        await update.message.reply_text("Brak wpisow do usuniecia.")
+    meal = get_last_meal(user_id)
+    if not meal:
+        await update.message.reply_text("Brak posilkow do usuniecia.")
         return
     keyboard = [[
-        InlineKeyboardButton("Usun", callback_data=f"del_{last['id']}"),
-        InlineKeyboardButton("Anuluj", callback_data="cancel")
+        InlineKeyboardButton("✅ Tak, usun", callback_data=f"del_{meal['id']}"),
+        InlineKeyboardButton("❌ Anuluj", callback_data="cancel")
     ]]
     await update.message.reply_text(
-        f"Usunac: <b>{last['name']}</b> — {last['kcal']} kcal?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        f"Usunac ostatni wpis?\n<b>{meal.get('name','?')}</b> — {meal.get('kcal',0)} kcal",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
+
+async def show_meal_confirm(msg, ctx, data, user_id):
+    ctx.user_data["pending"] = data
+    name = data.get("name", "Posilek")
+    kcal = data.get("kcal", 0)
+    protein = data.get("protein_g", data.get("protein", 0))
+    carbs = data.get("carbs_g", data.get("carbs", 0))
+    fat = data.get("fat_g", data.get("fat", 0))
+    conf = data.get("confidence", "medium")
+    conf_icon = "🟢" if conf == "high" else "🟡" if conf == "medium" else "🔴"
+    keyboard = [[
+        InlineKeyboardButton("✅ Zapisz", callback_data="save"),
+        InlineKeyboardButton("✏️ Edytuj", callback_data="edit"),
+        InlineKeyboardButton("❌ Anuluj", callback_data="cancel")
+    ]]
+    await msg.edit_text(
+        f"{conf_icon} <b>{name}</b>\n\n"
+        f"🔥 <b>{kcal} kcal</b>\n"
+        f"🥩 Białko: {round(float(protein or 0), 1)}g\n"
+        f"🍞 Węgle: {round(float(carbs or 0), 1)}g\n"
+        f"🧈 Tłuszcz: {round(float(fat or 0), 1)}g",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
     )
 
 async def handle_photo(update, ctx):
@@ -248,83 +289,40 @@ async def handle_label(update, ctx, msg, data, user_id):
     protein = data.get("protein_total", data.get("protein_100g", 0))
     carbs = data.get("carbs_total", data.get("carbs_100g", 0))
     fat = data.get("fat_total", data.get("fat_100g", 0))
-    portion = data.get("portion_g", 100)
-    ctx.user_data["pending"] = {"name": name, "kcal": kcal, "protein": protein, "carbs": carbs, "fat": fat, "portion_g": portion, "source": "label"}
-    keyboard = [[
-        InlineKeyboardButton("Zapisz", callback_data="save"),
-        InlineKeyboardButton("Inna ilosc", callback_data="edit"),
-        InlineKeyboardButton("Anuluj", callback_data="cancel")
-    ]]
-    await msg.edit_text(
-        f"Etykieta: <b>{name}</b>\nPorcja: {portion}g\nKalorie: <b>{kcal} kcal</b>\nBialko: {protein}g | Wegle: {carbs}g | Tluszcze: {fat}g",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    if data.get("needs_portion"):
+        ctx.user_data["pending"] = data
+        ctx.user_data["awaiting_clarification"] = True
+        await msg.edit_text(
+            f"Etykieta: <b>{name}</b>\n"
+            f"Na 100g: {data.get('kcal_100g',0)} kcal\n\n"
+            "Ile gramow/ml zjadles?",
+            parse_mode="HTML"
+        )
+        return
+    meal_data = {"name": name, "kcal": kcal, "protein_g": protein, "carbs_g": carbs, "fat_g": fat, "source": "label", "confidence": "high"}
+    await show_meal_confirm(msg, ctx, meal_data, user_id)
 
 async def handle_fridge(update, ctx, msg, data, user_id):
     items = data.get("items", [])
-    goal = get_goal(user_id)
-    eaten = get_today_kcal(user_id)
-    remaining = goal - eaten
-    lines = [f"Lodowka — pozostalo do celu: <b>{remaining} kcal</b>\n", "<b>Widze:</b>"]
-    for item in items[:8]:
-        lines.append(f"  {item.get('name','?')} ~{item.get('amount_g','?')}g — {item.get('kcal_total', '?')} kcal")
-    lines.append("\n<b>Propozycja:</b>")
-    budget = remaining
-    for item in sorted(items, key=lambda x: x.get("kcal_total", 999)):
-        kcal = item.get("kcal_total", 0)
-        if 0 < kcal <= budget:
-            lines.append(f"  {item.get('name')} {item.get('amount_g','?')}g — {kcal} kcal")
-            budget -= kcal
-    await msg.edit_text("\n".join(lines), parse_mode="HTML")
-
-async def show_meal_confirm(msg, ctx, data, user_id):
-    ctx.user_data["pending"] = {
-        "name": data.get("name", "Posilek"),
-        "kcal": int(data.get("kcal", data.get("total_kcal", 0))),
-        "protein": round(float(data.get("protein_g", data.get("total_protein_g", 0))), 1),
-        "carbs": round(float(data.get("carbs_g", data.get("total_carbs_g", 0))), 1),
-        "fat": round(float(data.get("fat_g", data.get("total_fat_g", 0))), 1),
-        "source": "photo"
-    }
-    meal = ctx.user_data["pending"]
-    items = data.get("items", [])
-    text = (f"<b>{meal['name']}</b>\n\n"
-            f"Kalorie: <b>{meal['kcal']} kcal</b>\n"
-            f"Bialko: {meal['protein']}g | Wegle: {meal['carbs']}g | Tluszcze: {meal['fat']}g\n")
-    if items:
-        text += "\n<b>Skladniki:</b>\n"
-        for it in items[:5]:
-            text += f"  {it.get('name','')} ~{it.get('amount_g','?')}g — {it.get('kcal','?')} kcal\n"
+    suggestion = data.get("suggestion", "brak propozycji")
+    kcal = data.get("suggestion_kcal", 0)
+    items_str = ", ".join(items[:8]) if items else "brak"
+    ctx.user_data["pending"] = {"name": suggestion, "kcal": kcal, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "source": "photo"}
     keyboard = [[
-        InlineKeyboardButton("Zapisz", callback_data="save"),
-        InlineKeyboardButton("Popraw ilosc", callback_data="edit"),
-        InlineKeyboardButton("Anuluj", callback_data="cancel")
+        InlineKeyboardButton("✅ Zapisz propozycje", callback_data="save"),
+        InlineKeyboardButton("❌ Anuluj", callback_data="cancel")
     ]]
-    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-
-def parse_text_meal_sync(text):
-    """Claude parsuje opis tekstowy jedzenia i zwraca makro"""
-    resp = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=400,
-        messages=[{"role": "user", "content":
-            f"Uzytkownik opisal co zjadl/wypil: \"{text}\"\n\n"
-            "Oblicz wartosci odzywcze na podstawie podanych ilosci.\n"
-            "Uzyj standardowych wartosci dla tych produktow.\n"
-            "Odpowiedz TYLKO JSON bez markdown:\n"
-            '{"name":"krotka nazwa po polsku","kcal":150,"protein_g":5,"carbs_g":20,"fat_g":3,"items":[{"name":"skladnik","amount_g":20,"kcal":80}],"confidence":"high"}'
-        }]
+    await msg.edit_text(
+        f"❄️ W lodowce: <b>{items_str}</b>\n\n"
+        f"Propozycja: <b>{suggestion}</b> (~{kcal} kcal)",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
     )
-    raw = re.sub(r"```(?:json)?\s*", "", resp.content[0].text.strip()).rstrip("`").strip()
-    return json.loads(raw)
-
 
 async def handle_text(update, ctx):
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Ustawianie celu kalorycznego
     if ctx.user_data.get("awaiting_goal"):
         ctx.user_data.pop("awaiting_goal")
         try:
@@ -338,7 +336,6 @@ async def handle_text(update, ctx):
             await update.message.reply_text("Podaj sama liczbe, np. 2000")
         return
 
-    # Odpowiedz na pytanie o gramature po zdjeciu
     if ctx.user_data.get("awaiting_clarification"):
         ctx.user_data.pop("awaiting_clarification")
         pending = ctx.user_data.get("pending", {})
@@ -359,16 +356,15 @@ async def handle_text(update, ctx):
             await msg.edit_text(f"Blad: {e}")
         return
 
-    # Naturalne opisy jedzenia — dowolny tekst o posilku
     food_keywords = ["zjadl", "zjadam", "zjadlem", "zjadlam", "wypil", "wypilam", "wypilem",
                      "jad", "pil", "pije", "jem", "g ", "ml ", "sztuk", "kawe", "kawy",
                      "mleko", "cukier", "chleb", "ryż", "kurczak", "jajk", "owsiank"]
     text_lower = text.lower()
-    is_food_description = any(kw in text_lower for kw in food_keywords) or (
+    is_food = any(kw in text_lower for kw in food_keywords) or (
         any(c.isdigit() for c in text) and len(text) > 5
     )
 
-    if is_food_description:
+    if is_food:
         msg = await update.message.reply_text("Licze kalorie...")
         try:
             loop = asyncio.get_event_loop()
@@ -376,10 +372,9 @@ async def handle_text(update, ctx):
             await show_meal_confirm(msg, ctx, data, user_id)
         except Exception as e:
             logger.error(f"Text parse error: {e}", exc_info=True)
-            await msg.edit_text(f"Nie udalo mi sie przetworzyc opisu. Sprobuj inaczej lub wyslij zdjecie.")
+            await msg.edit_text("Nie udalo mi sie przetworzyc opisu. Sprobuj inaczej lub wyslij zdjecie.")
         return
 
-    # Nierozpoznana wiadomosc
     await update.message.reply_text(
         "Mozesz:\n"
         "📷 Wyslac <b>zdjecie</b> posilku, etykiety lub lodowki\n"
@@ -401,7 +396,7 @@ async def handle_callback(update, ctx):
             goal = get_goal(user_id)
             remaining = goal - total
             await query.edit_message_text(
-                f"Zapisano: <b>{meal['name']}</b> — {meal['kcal']} kcal\n\n"
+                f"✅ Zapisano: <b>{meal.get('name','posilek')}</b> ({meal.get('kcal',0)} kcal)\n\n"
                 f"Dzis razem: <b>{total} / {goal} kcal</b>\nPozostalo: <b>{abs(remaining)} kcal</b>",
                 parse_mode="HTML"
             )
@@ -416,34 +411,43 @@ async def handle_callback(update, ctx):
         await query.edit_message_text("Anulowano.")
         ctx.user_data.pop("pending", None)
 
-async def setup_bot():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("dzisiaj",  cmd_dzisiaj))
-    app.add_handler(CommandHandler("historia", cmd_historia))
-    app.add_handler(CommandHandler("cel",      cmd_cel))
-    app.add_handler(CommandHandler("usun",     cmd_usun))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    webhook_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-    if webhook_url:
-        webhook_url = f"https://{webhook_url}/webhook"
-    else:
-        webhook_url = f"{os.getenv('WEBHOOK_URL', '')}/webhook"
-    await app.bot.set_webhook(webhook_url, drop_pending_updates=True)
-    logger.info(f"Webhook ustawiony: {webhook_url}")
-    return app
+# ── FastAPI app ───────────────────────────────────────────────
+DASHBOARD_USER = os.getenv("DASHBOARD_USER", "marek")
+DASHBOARD_PASS = os.getenv("DASHBOARD_PASS", "nutribot123")
+
+api = FastAPI()
+security = HTTPBasic()
+
+def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    ok_user = secrets.compare_digest(credentials.username.encode(), DASHBOARD_USER.encode())
+    ok_pass = secrets.compare_digest(credentials.password.encode(), DASHBOARD_PASS.encode())
+    if not (ok_user and ok_pass):
+        raise HTTPException(status_code=401, detail="Nieprawidlowe haslo", headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
 
 bot_app = None
 
 @api.on_event("startup")
 async def startup():
     global bot_app
-    bot_app = await setup_bot()
+    bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start",    cmd_start))
+    bot_app.add_handler(CommandHandler("dzisiaj",  cmd_dzisiaj))
+    bot_app.add_handler(CommandHandler("historia", cmd_historia))
+    bot_app.add_handler(CommandHandler("cel",      cmd_cel))
+    bot_app.add_handler(CommandHandler("usun",     cmd_usun))
+    bot_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    bot_app.add_handler(CallbackQueryHandler(handle_callback))
     await bot_app.initialize()
     await bot_app.start()
-    logger.info("NutriBot uruchomiony!")
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    webhook_url = f"https://{domain}/webhook" if domain else os.getenv("WEBHOOK_URL", "")
+    if webhook_url:
+        await bot_app.bot.set_webhook(webhook_url, drop_pending_updates=True)
+        logger.info(f"Webhook ustawiony: {webhook_url}")
+    else:
+        logger.warning("Brak RAILWAY_PUBLIC_DOMAIN — webhook nie ustawiony")
 
 @api.on_event("shutdown")
 async def shutdown():
@@ -456,54 +460,20 @@ async def shutdown():
 async def webhook(request: Request):
     global bot_app
     data = await request.json()
-    from telegram import Update
     update = Update.de_json(data, bot_app.bot)
     await bot_app.process_update(update)
     return {"ok": True}
 
-
-# ── API ─────────────────────────────────────────────────────
-from fastapi import FastAPI, Depends, HTTPException, status, Request
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse
-import secrets
-import uvicorn
-
-DASHBOARD_USER = os.getenv("DASHBOARD_USER", "marek")
-DASHBOARD_PASS = os.getenv("DASHBOARD_PASS", "nutribot123")
-
-api = FastAPI()
-security = HTTPBasic()
-
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    ok_user = secrets.compare_digest(credentials.username.encode(), DASHBOARD_USER.encode())
-    ok_pass = secrets.compare_digest(credentials.password.encode(), DASHBOARD_PASS.encode())
-    if not (ok_user and ok_pass):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Nieprawidlowe haslo",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
-
 @api.get("/api/today")
 def api_today(user: str = Depends(check_auth)):
     today = date.today().isoformat()
-    # pobierz pierwszego usera z Supabase
     users = sb_request("GET", "users", params="?order=user_id.asc&limit=1")
     uid = users[0]["user_id"] if users else None
     goal = users[0]["goal"] if users else DEFAULT_KCAL_GOAL
-    if uid:
-        meals = sb_request("GET", "meals", params=f"?user_id=eq.{uid}&date=eq.{today}&order=created_at.asc")
-    else:
-        meals = []
+    meals = sb_request("GET", "meals", params=f"?user_id=eq.{uid}&date=eq.{today}&order=created_at.asc") if uid else []
     total = sum(m.get("kcal", 0) for m in meals)
     return {
-        "date": today,
-        "goal": goal,
-        "total_kcal": total,
-        "remaining": goal - total,
+        "date": today, "goal": goal, "total_kcal": total, "remaining": goal - total,
         "total_protein": round(sum(m.get("protein", 0) for m in meals), 1),
         "total_carbs":   round(sum(m.get("carbs", 0)   for m in meals), 1),
         "total_fat":     round(sum(m.get("fat", 0)     for m in meals), 1),
@@ -512,23 +482,19 @@ def api_today(user: str = Depends(check_auth)):
 
 @api.get("/api/history")
 def api_history(user: str = Depends(check_auth)):
+    from datetime import timedelta
     users = sb_request("GET", "users", params="?order=user_id.asc&limit=1")
     uid = users[0]["user_id"] if users else None
     result = []
     for i in range(6, -1, -1):
         d = (date.today() - timedelta(days=i)).isoformat()
-        if uid:
-            day_meals = sb_request("GET", "meals", params=f"?user_id=eq.{uid}&date=eq.{d}")
-        else:
-            day_meals = []
+        day_meals = sb_request("GET", "meals", params=f"?user_id=eq.{uid}&date=eq.{d}") if uid else []
         kcal = sum(m.get("kcal", 0) for m in day_meals)
         dt = datetime.strptime(d, "%Y-%m-%d")
         result.append({
-            "date": d,
-            "label": dt.strftime("%d.%m"),
+            "date": d, "label": dt.strftime("%d.%m"),
             "day": ["Pn","Wt","Sr","Cz","Pt","Sb","Nd"][dt.weekday()],
-            "kcal": kcal,
-            "meals_count": len(day_meals)
+            "kcal": kcal, "meals_count": len(day_meals)
         })
     return result
 
@@ -538,10 +504,6 @@ def dashboard(user: str = Depends(check_auth)):
         with open("dashboard.html") as f:
             return f.read()
     return "<h1>Dashboard nie znaleziony</h1>"
-
-def run_api():
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(api, host="0.0.0.0", port=port, log_level="warning")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
