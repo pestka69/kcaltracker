@@ -27,7 +27,6 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 import os
 import urllib.request
-import time
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -93,7 +92,6 @@ def delete_meal_by_id(meal_id):
     sb_request("DELETE", "meals", params=f"?id=eq.{meal_id}")
 
 def get_week_meals(user_id):
-    from datetime import timedelta
     result = []
     for i in range(6, -1, -1):
         d = (date.today() - timedelta(days=i)).isoformat()
@@ -418,7 +416,7 @@ async def handle_callback(update, ctx):
         await query.edit_message_text("Anulowano.")
         ctx.user_data.pop("pending", None)
 
-def main():
+async def setup_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("dzisiaj",  cmd_dzisiaj))
@@ -428,19 +426,49 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    time.sleep(30)
+    webhook_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    if webhook_url:
+        webhook_url = f"https://{webhook_url}/webhook"
+    else:
+        webhook_url = f"{os.getenv('WEBHOOK_URL', '')}/webhook"
+    await app.bot.set_webhook(webhook_url, drop_pending_updates=True)
+    logger.info(f"Webhook ustawiony: {webhook_url}")
+    return app
+
+bot_app = None
+
+@api.on_event("startup")
+async def startup():
+    global bot_app
+    bot_app = await setup_bot()
+    await bot_app.initialize()
+    await bot_app.start()
     logger.info("NutriBot uruchomiony!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+@api.on_event("shutdown")
+async def shutdown():
+    global bot_app
+    if bot_app:
+        await bot_app.stop()
+        await bot_app.shutdown()
+
+@api.post("/webhook")
+async def webhook(request: Request):
+    global bot_app
+    data = await request.json()
+    from telegram import Update
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.process_update(update)
+    return {"ok": True}
 
 
 # ── API ─────────────────────────────────────────────────────
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
 import secrets
 import uvicorn
-import threading
 
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "marek")
 DASHBOARD_PASS = os.getenv("DASHBOARD_PASS", "nutribot123")
@@ -484,7 +512,6 @@ def api_today(user: str = Depends(check_auth)):
 
 @api.get("/api/history")
 def api_history(user: str = Depends(check_auth)):
-    from datetime import timedelta
     users = sb_request("GET", "users", params="?order=user_id.asc&limit=1")
     uid = users[0]["user_id"] if users else None
     result = []
@@ -517,8 +544,5 @@ def run_api():
     uvicorn.run(api, host="0.0.0.0", port=port, log_level="warning")
 
 if __name__ == "__main__":
-    # Uruchom API w tle, bot w głównym wątku
-    t = threading.Thread(target=run_api, daemon=True)
-    t.start()
-    logger.info(f"API uruchomione na porcie {os.getenv('PORT', 8000)}")
-    main()
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(api, host="0.0.0.0", port=port, log_level="info")
